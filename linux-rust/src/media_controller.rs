@@ -318,41 +318,68 @@ impl MediaController {
         // stale as soon as the AirPods drop and come back -- and a stale index
         // makes every check below fail against a nonexistent card. Resolve it
         // fresh by MAC each time instead.
-        match self.get_audio_device_index(&mac).await {
+        let device_index = match self.get_audio_device_index(&mac).await {
             Some(idx) => {
                 self.state.lock().await.device_index = Some(idx);
+                idx
             }
             None => {
                 warn!("Could not get device index. Cannot activate A2DP profile.");
                 return;
             }
-        }
+        };
 
         // If the card is already on an A2DP profile, leave it alone. Switching
         // profiles (even between two a2dp-sink variants) tears down and
         // recreates the PipeWire sink, which kills the very stream whose start
         // triggered this call -- players like Chromium react by pausing, so
         // every resume immediately pauses itself again.
-        if let Some(idx) = current_device_index
-            && let Some(active) = self.get_active_profile(idx).await
+        if let Some(active) = self.get_active_profile(device_index).await
             && active.starts_with("a2dp-sink")
         {
             info!("A2DP profile {} already active, not switching", active);
             return;
         }
 
-        if !self.is_a2dp_profile_available().await {
+        let mut a2dp_available = self.is_a2dp_profile_available().await;
+        if !a2dp_available {
+            // A freshly (re)connected card often lists no a2dp-sink profiles
+            // for a moment while enumeration finishes. Give it a chance to
+            // settle before reaching for the sledgehammer below -- restarting
+            // WirePlumber tears down the whole audio session, and doing so
+            // mid-reconnect can leave the card stuck on profile "off".
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if let Some(idx) = self.get_audio_device_index(&mac).await {
+                self.state.lock().await.device_index = Some(idx);
+            }
+            a2dp_available = self.is_a2dp_profile_available().await;
+        }
+
+        if !a2dp_available {
             warn!("A2DP profile not available, attempting to restart WirePlumber");
             if self.restart_wire_plumber().await {
-                let mut state = self.state.lock().await;
-                state.device_index = self
-                    .get_audio_device_index(&state.connected_device_mac)
-                    .await;
-                debug!(
-                    "Updated device_index after WirePlumber restart: {:?}",
-                    state.device_index
-                );
-                if !self.is_a2dp_profile_available().await {
+                // pipewire-pulse needs a moment to re-enumerate the Bluetooth
+                // card after WirePlumber restarts; a single immediate re-check
+                // races that re-enumeration and usually loses.
+                let mac = self.state.lock().await.connected_device_mac.clone();
+                let mut ready = false;
+                for attempt in 1..=5u64 {
+                    if let Some(idx) = self.get_audio_device_index(&mac).await {
+                        self.state.lock().await.device_index = Some(idx);
+                        if self.is_a2dp_profile_available().await {
+                            ready = true;
+                            break;
+                        }
+                    }
+                    if attempt < 5 {
+                        debug!(
+                            "A2DP profile still not ready after WirePlumber restart \
+                             (attempt {attempt}/5), retrying"
+                        );
+                        tokio::time::sleep(Duration::from_secs(attempt)).await;
+                    }
+                }
+                if !ready {
                     error!("A2DP profile still not available after WirePlumber restart");
                     return;
                 }
