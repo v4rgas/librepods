@@ -219,6 +219,10 @@ impl AirPodsDevice {
             while let Some(value) = owns_connection_rx.recv().await {
                 let owns = value.first().copied().unwrap_or(0) != 0;
                 if !owns {
+                    if !crate::utils::handoff_enabled() {
+                        info!("Lost ownership but handoff is disabled, keeping audio");
+                        continue;
+                    }
                     info!("Lost ownership, pausing media and disconnecting audio");
                     let controller = mc_clone_owns.lock().await;
                     controller.pause_all_media().await;

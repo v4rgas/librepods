@@ -152,6 +152,10 @@ impl MediaController {
             drop(state);
 
             if !was_playing && is_playing {
+                if !crate::utils::handoff_enabled() {
+                    debug!("Handoff disabled, skipping takeover");
+                    continue;
+                }
                 let (bud_in_ear, connected_devices) = {
                     let aacp_state = aacp_manager.state.lock().await;
                     (

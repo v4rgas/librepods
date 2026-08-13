@@ -51,6 +51,20 @@ pub fn get_app_settings_path() -> PathBuf {
     new_path
 }
 
+/// Whether the earbuds may follow media playback between this machine and other
+/// devices. Off leaves them where they are: playing here will not pull them over,
+/// and another device claiming them will not drop our audio.
+///
+/// Read from disk at each use so the toggle takes effect without a reconnect.
+pub fn handoff_enabled() -> bool {
+    std::fs::read_to_string(get_app_settings_path())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("handoff").cloned())
+        .and_then(|h| serde_json::from_value(h).ok())
+        .unwrap_or(true)
+}
+
 fn e(key: &[u8; 16], data: &[u8; 16]) -> [u8; 16] {
     let mut swapped_key = *key;
     swapped_key.reverse();

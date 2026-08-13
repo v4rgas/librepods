@@ -76,6 +76,7 @@ pub struct App {
     selected_device_type: Option<DeviceType>,
     tray_text_mode: bool,
     stem_control: bool,
+    handoff: bool,
 }
 
 pub struct BluetoothState {
@@ -108,6 +109,7 @@ pub enum Message {
     StateChanged(String, DeviceState),
     TrayTextModeChanged(bool), // yes, I know I should add all settings to a struct, but I'm lazy
     StemControlChanged(bool),
+    HandoffChanged(bool),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -166,6 +168,11 @@ impl App {
             .and_then(|v| v.get("stem_control").cloned())
             .and_then(|s| serde_json::from_value(s).ok())
             .unwrap_or(false);
+        let handoff = settings
+            .clone()
+            .and_then(|v| v.get("handoff").cloned())
+            .and_then(|h| serde_json::from_value(h).ok())
+            .unwrap_or(true);
 
         let bluetooth_state = BluetoothState::new();
 
@@ -217,6 +224,7 @@ impl App {
                 device_managers,
                 tray_text_mode,
                 stem_control,
+                handoff,
             },
             Task::batch(vec![open_task, wait_task]),
         )
@@ -626,37 +634,38 @@ impl App {
             }
             Message::TrayTextModeChanged(is_enabled) => {
                 self.tray_text_mode = is_enabled;
-                let app_settings_path = get_app_settings_path();
-                let settings = serde_json::json!({
-                    "theme": self.selected_theme,
-                    "tray_text_mode": self.tray_text_mode,
-                    "stem_control": self.stem_control,
-                });
-                debug!(
-                    "Writing settings to {}: {}",
-                    app_settings_path.to_str().unwrap(),
-                    settings
-                );
-                std::fs::write(app_settings_path, settings.to_string()).ok();
+                self.save_settings();
                 Task::none()
             }
             Message::StemControlChanged(is_enabled) => {
                 self.stem_control = is_enabled;
-                let app_settings_path = get_app_settings_path();
-                let settings = serde_json::json!({
-                    "theme": self.selected_theme,
-                    "tray_text_mode": self.tray_text_mode,
-                    "stem_control": self.stem_control,
-                });
-                debug!(
-                    "Writing settings to {}: {}",
-                    app_settings_path.to_str().unwrap(),
-                    settings
-                );
-                std::fs::write(app_settings_path, settings.to_string()).ok();
+                self.save_settings();
+                Task::none()
+            }
+            Message::HandoffChanged(is_enabled) => {
+                self.handoff = is_enabled;
+                self.save_settings();
                 Task::none()
             }
         }
+    }
+
+    /// Writes every setting at once. Each toggle rewrites the whole file, so a
+    /// setting left out here would be dropped whenever another one is flipped.
+    fn save_settings(&self) {
+        let app_settings_path = get_app_settings_path();
+        let settings = serde_json::json!({
+            "theme": self.selected_theme,
+            "tray_text_mode": self.tray_text_mode,
+            "stem_control": self.stem_control,
+            "handoff": self.handoff,
+        });
+        debug!(
+            "Writing settings to {}: {}",
+            app_settings_path.to_str().unwrap(),
+            settings
+        );
+        std::fs::write(app_settings_path, settings.to_string()).ok();
     }
 
     fn view(&self, _id: window::Id) -> Element<'_, Message> {
@@ -1096,6 +1105,47 @@ impl App {
                                         )
                                     .align_y(Center);
 
+                            let handoff_value = self.handoff;
+                            let handoff_toggle = container(
+                                row![
+                                    column![
+                                        text("Handoff").size(16),
+                                        text("Let the earbuds follow playback between this machine and your other devices. Disable to keep them here: playing locally will not pull them over, and another device claiming them will not stop your audio.").size(12).style(
+                                            |theme: &Theme| {
+                                                let mut style = text::Style::default();
+                                                style.color = Some(theme.palette().text.scale_alpha(0.7));
+                                                style
+                                            }
+                                        ).width(Length::Fill)
+                                    ].width(Length::Fill),
+                                    toggler(handoff_value)
+                                        .on_toggle(move |is_enabled| {
+                                            Message::HandoffChanged(is_enabled)
+                                        })
+                                    .spacing(0)
+                                    .size(20)
+                                    ]
+                                        .align_y(Center)
+                                        .spacing(12)
+                                    )
+                                        .padding(Padding{
+                                            top: 5.0,
+                                            bottom: 5.0,
+                                            left: 18.0,
+                                            right: 18.0,
+                                        })
+                                        .style(
+                                            |theme: &Theme| {
+                                                let mut style = container::Style::default();
+                                                style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
+                                                let mut border = Border::default();
+                                                border.color = theme.palette().primary.scale_alpha(0.5);
+                                                style.border = border.rounded(16);
+                                                style
+                                            }
+                                        )
+                                    .align_y(Center);
+
                             let controls_settings_col = column![
                                 container(
                                     text("Controls").size(20).style(
@@ -1112,7 +1162,8 @@ impl App {
                                     left: 18.0,
                                     right: 18.0,
                                 }),
-                                stem_control_toggle
+                                stem_control_toggle,
+                                handoff_toggle
                             ]
                             .spacing(12);
 
