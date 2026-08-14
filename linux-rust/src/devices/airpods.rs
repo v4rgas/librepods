@@ -226,7 +226,9 @@ impl AirPodsDevice {
                     info!("Lost ownership, pausing media and disconnecting audio");
                     let controller = mc_clone_owns.lock().await;
                     controller.pause_all_media().await;
-                    controller.deactivate_a2dp_profile().await;
+                    controller
+                        .deactivate_a2dp_profile("another device claimed ownership")
+                        .await;
                 }
             }
         });
@@ -345,6 +347,12 @@ impl AirPodsDevice {
                         }
                     }
                     AACPEvent::OwnershipToFalseRequest => {
+                        if !crate::utils::handoff_enabled() {
+                            info!(
+                                "Received ownership to false request but handoff is disabled, keeping audio"
+                            );
+                            continue;
+                        }
                         info!(
                             "Received ownership to false request. Setting ownership to false and pausing media."
                         );
@@ -352,7 +360,9 @@ impl AirPodsDevice {
                             .send((ControlCommandIdentifiers::OwnsConnection, vec![0x00]));
                         let controller = mc_clone.lock().await;
                         controller.pause_all_media().await;
-                        controller.deactivate_a2dp_profile().await;
+                        controller
+                            .deactivate_a2dp_profile("AirPods requested ownership release")
+                            .await;
                     }
                     AACPEvent::StemPress(press_type, bud_type) => {
                         use crate::bluetooth::aacp::StemPressType;

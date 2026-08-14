@@ -45,7 +45,67 @@ struct Args {
     )]
     le_debug: bool,
     #[arg(long, short = 'v', help = "Show application version and exit")]
-    version: bool
+    version: bool,
+    #[arg(
+        long,
+        help = "Disable the BLE advertisement monitor used for proximity pairing. \
+                Scanning for advertisements competes with A2DP for radio time, so \
+                turning it off can stop audio dropouts on adapters that schedule \
+                the two poorly."
+    )]
+    no_le: bool
+}
+
+/// Writes every log line to the terminal and to the rolling log file, so a bad
+/// session can still be read after its terminal is gone.
+struct Tee {
+    file: Option<std::fs::File>,
+}
+
+impl std::io::Write for Tee {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(file) = self.file.as_mut() {
+            let _ = file.write_all(buf);
+        }
+        std::io::stderr().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            let _ = file.flush();
+        }
+        std::io::stderr().flush()
+    }
+}
+
+const LOG_ROTATE_BYTES: u64 = 16 * 1024 * 1024;
+
+fn init_logging() {
+    let path = utils::get_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Keep one generation back; a drop reported "yesterday" is still readable.
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > LOG_ROTATE_BYTES {
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok();
+    let opened = file.is_some();
+
+    env_logger::Builder::from_env(env_logger::Env::default())
+        .target(env_logger::Target::Pipe(Box::new(Tee { file })))
+        .write_style(env_logger::WriteStyle::Never)
+        .init();
+
+    if opened {
+        info!("Logging to {}", path.display());
+    } else {
+        warn!("Could not open log file at {}", path.display());
+    }
 }
 
 fn main() -> iced::Result {
@@ -76,7 +136,12 @@ fn main() -> iced::Result {
             )
         };
     }
-    env_logger::init();
+    init_logging();
+    info!(
+        "LibrePods {} starting: {:?}",
+        env!("CARGO_PKG_VERSION"),
+        utils::AppSettings::load()
+    );
 
     let (ui_tx, ui_rx) = unbounded_channel::<BluetoothUIMessage>();
 
@@ -166,13 +231,17 @@ async fn async_main(
     let adapter = session.default_adapter().await?;
     adapter.set_powered(true).await?;
 
-    let le_tray_clone = tray_handle.clone();
-    tokio::spawn(async move {
-        info!("Starting LE monitor...");
-        if let Err(e) = start_le_monitor(le_tray_clone).await {
-            log::error!("LE monitor error: {}", e);
-        }
-    });
+    if args.no_le {
+        info!("LE monitor disabled (--no-le), proximity pairing will not work");
+    } else {
+        let le_tray_clone = tray_handle.clone();
+        tokio::spawn(async move {
+            info!("Starting LE monitor...");
+            if let Err(e) = start_le_monitor(le_tray_clone).await {
+                log::error!("LE monitor error: {}", e);
+            }
+        });
+    }
 
     info!("Listening for new connections.");
 

@@ -53,6 +53,17 @@ pub fn get_preferences_path() -> PathBuf {
         .join("preferences.json")
 }
 
+/// Rolling log file, kept so a session that misbehaved can be inspected after the
+/// fact instead of only living in whatever terminal launched us.
+pub fn get_log_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let state_dir =
+        std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| format!("{}/.local/state", home));
+    PathBuf::from(state_dir)
+        .join("librepods")
+        .join("librepods.log")
+}
+
 pub fn get_app_settings_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
 

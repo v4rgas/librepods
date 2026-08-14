@@ -29,6 +29,13 @@ static PLAYBACK_LISTENERS: LazyLock<StdMutex<HashMap<String, AbortHandle>>> =
 #[derive(Clone, Debug)]
 struct OwnedCardProfileInfo {
     name: Option<String>,
+    /// Carries the codec, e.g. "High Fidelity Playback (A2DP Sink, codec AAC)".
+    /// The profile *name* for AAC is unsuffixed ("a2dp-sink") on some PipeWire
+    /// versions and "a2dp-sink-aac" on others, so the codec is read from here.
+    description: Option<String>,
+    /// PipeWire's own ranking; it already prefers AAC over SBC on AirPods.
+    priority: u32,
+    available: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -174,7 +181,7 @@ impl MediaController {
                     crate::bluetooth::aacp::ControlCommandIdentifiers::OwnsConnection,
                     vec![0x01],
                 ));
-                self.activate_a2dp_profile().await;
+                self.activate_a2dp_profile("playback takeover").await;
 
                 info!("already connected locally, hijacking connection by asking AirPods");
 
@@ -260,7 +267,7 @@ impl MediaController {
 
         if new_has_at_least_one_in && old_all_out {
             debug!("Condition met: buds inserted, activating A2DP and checking play state");
-            self.activate_a2dp_profile().await;
+            self.activate_a2dp_profile("bud inserted in ear").await;
             {
                 let mut state = self.state.lock().await;
                 if state.is_playing {
@@ -276,7 +283,7 @@ impl MediaController {
                 if state.disconnect_when_not_wearing {
                     debug!("Disconnect when not wearing enabled, deactivating A2DP");
                     drop(state);
-                    self.deactivate_a2dp_profile().await;
+                    self.deactivate_a2dp_profile("both buds removed, disconnect_when_not_wearing").await;
                 }
             }
         }
@@ -323,8 +330,8 @@ impl MediaController {
         }
     }
 
-    pub async fn activate_a2dp_profile(&self) {
-        debug!("Entering activate_a2dp_profile");
+    pub async fn activate_a2dp_profile(&self, reason: &str) {
+        info!("Activating A2DP profile (reason: {})", reason);
         let state = self.state.lock().await;
 
         if state.connected_device_mac.is_empty() {
@@ -358,8 +365,25 @@ impl MediaController {
         if let Some(active) = self.get_active_profile(device_index).await
             && active.starts_with("a2dp-sink")
         {
-            info!("A2DP profile {} already active, not switching", active);
-            return;
+            // ...unless we are sitting on a worse codec than the card offers.
+            // A dropped transport can bring the card back on SBC, and without
+            // this the guard would pin us there until the next reconnect. Only
+            // correct it while nothing is playing, so we never tear the sink
+            // out from under a live stream.
+            let preferred = self.pick_best_a2dp_profile(device_index).await;
+            let is_playing = self.state.lock().await.is_playing;
+            match preferred {
+                Some(preferred) if preferred != active && !is_playing => {
+                    info!(
+                        "Active profile {} is not the preferred {}, switching",
+                        active, preferred
+                    );
+                }
+                _ => {
+                    info!("A2DP profile {} already active, not switching", active);
+                    return;
+                }
+            }
         }
 
         let mut a2dp_available = self.is_a2dp_profile_available().await;
@@ -626,15 +650,79 @@ impl MediaController {
             return cached_profile;
         }
 
-        for profile in ["a2dp-sink-sbc_xq", "a2dp-sink-sbc", "a2dp-sink"] {
-            if self.is_profile_available(index, profile).await {
-                info!("Selected best available A2DP profile: {}", profile);
-                self.state.lock().await.cached_a2dp_profile = profile.to_string();
-                return profile.to_string();
+        match self.pick_best_a2dp_profile(index).await {
+            Some(profile) => {
+                self.state.lock().await.cached_a2dp_profile = profile.clone();
+                profile
+            }
+            None => {
+                debug!("No suitable profile found");
+                String::new()
             }
         }
-        debug!("No suitable profile found");
-        String::new()
+    }
+
+    /// Ranks a codec for AirPods playback. AAC first: the buds support it
+    /// natively, so it sounds better than SBC at the same bitrate and is what
+    /// they negotiate with an iPhone. SBC-XQ is last -- it is an unofficial
+    /// extension the AirPods do not advertise, and PipeWire itself ranks it
+    /// below plain SBC.
+    fn codec_rank(description: &str) -> u8 {
+        let d = description.to_ascii_lowercase();
+        if d.contains("codec aac") {
+            0
+        } else if d.contains("codec sbc-xq") {
+            2
+        } else if d.contains("codec sbc") {
+            1
+        } else {
+            3
+        }
+    }
+
+    /// Picks the best available A2DP sink profile by codec, breaking ties with
+    /// PipeWire's own priority. Selecting by codec rather than by profile name
+    /// matters because AAC is named "a2dp-sink" on some PipeWire versions and
+    /// "a2dp-sink-aac" on others -- a name-ordered list silently lands on SBC.
+    async fn pick_best_a2dp_profile(&self, card_index: u32) -> Option<String> {
+        let candidates = tokio::task::spawn_blocking(move || {
+            get_card_info_list_sync()
+                .iter()
+                .find(|c| c.index == card_index)
+                .map(|card| {
+                    card.profiles
+                        .iter()
+                        .filter(|p| p.available)
+                        .filter_map(|p| {
+                            let name = p.name.clone()?;
+                            if !name.starts_with("a2dp-sink") {
+                                return None;
+                            }
+                            let description = p.description.clone().unwrap_or_default();
+                            Some((name, description, p.priority))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default();
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        debug!("Available A2DP profiles: {:?}", candidates);
+
+        let best = candidates.iter().min_by_key(|(_, description, priority)| {
+            (Self::codec_rank(description), std::cmp::Reverse(*priority))
+        })?;
+
+        info!(
+            "Selected best available A2DP profile: {} ({})",
+            best.0, best.1
+        );
+        Some(best.0.clone())
     }
 
     async fn get_active_profile(&self, card_index: u32) -> Option<String> {
@@ -708,8 +796,8 @@ impl MediaController {
             .unwrap_or(None)
     }
 
-    pub async fn deactivate_a2dp_profile(&self) {
-        debug!("Entering deactivate_a2dp_profile");
+    pub async fn deactivate_a2dp_profile(&self, reason: &str) {
+        info!("Deactivating A2DP profile (reason: {})", reason);
         let mut state = self.state.lock().await;
 
         if state.device_index.is_none() {
@@ -991,6 +1079,9 @@ fn get_card_info_list_sync() -> Vec<OwnedCardInfo> {
                     .iter()
                     .map(|p| OwnedCardProfileInfo {
                         name: p.name.as_ref().map(|n| n.to_string()),
+                        description: p.description.as_ref().map(|d| d.to_string()),
+                        priority: p.priority,
+                        available: p.available,
                     })
                     .collect();
                 cards.borrow_mut().push(OwnedCardInfo {

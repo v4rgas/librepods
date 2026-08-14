@@ -999,6 +999,18 @@ impl AACPManager {
                 let typ = AudioSourceType::from_u8(payload[8]).unwrap_or(AudioSourceType::None);
                 let audio_source = AudioSource { mac, r#type: typ };
                 let mut state = self.state.lock().await;
+                let previous = state.audio_source.take();
+                // A source that flips away and back is the earbuds being pulled
+                // between two hosts; call it out so the pattern is greppable.
+                match &previous {
+                    Some(prev) if prev.mac != audio_source.mac || prev.r#type != audio_source.r#type => {
+                        warn!(
+                            "Audio source changed: {} ({:?}) -> {} ({:?})",
+                            prev.mac, prev.r#type, audio_source.mac, audio_source.r#type
+                        );
+                    }
+                    _ => {}
+                }
                 state.audio_source = Some(audio_source.clone());
                 if let Some(ref tx) = state.event_tx {
                     let _ = tx.send(AACPEvent::AudioSource(audio_source));
@@ -1383,7 +1395,7 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
     loop {
         match sp.recv(&mut buf).await {
             Ok(0) => {
-                info!("Remote closed the connection.");
+                warn!("AACP link closed by the remote device.");
                 break;
             }
             Ok(n) => {
@@ -1407,9 +1419,9 @@ async fn recv_thread(manager: AACPManager, sp: Arc<SeqPacket>) {
                 manager.receive_packet(data).await;
             }
             Err(e) => {
-                debug!("Read error: {}", e);
-                info!(
-                    "We have probably disconnected, clearing state variables (owns=false, connected_devices=empty, control_command_status_list=empty)."
+                warn!(
+                    "AACP read failed ({}); assuming disconnect and clearing state (owns=false, connected_devices=empty, control_command_status_list=empty).",
+                    e
                 );
                 let mut state = manager.state.lock().await;
                 state.owns = false;
